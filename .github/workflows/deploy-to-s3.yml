@@ -1,0 +1,106 @@
+name: Deploy Website to Amazon S3
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "website/**"
+      - ".github/workflows/deploy-to-s3.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: s3-production-deployment
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate website files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Confirm required files exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f website/index.html
+          test -f website/styles.css
+          test -f website/app.js
+          echo "Required website files are present."
+
+      - name: Display files selected for deployment
+        run: find website -maxdepth 2 -type f -print
+
+  deploy:
+    name: Deploy files to S3
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment variables
+        shell: bash
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_REGION" || { echo "AWS_REGION variable is missing."; exit 1; }
+          test -n "$AWS_ROLE_ARN" || { echo "AWS_ROLE_ARN variable is missing."; exit 1; }
+          test -n "$S3_BUCKET_NAME" || { echo "S3_BUCKET_NAME variable is missing."; exit 1; }
+
+      - name: Configure temporary AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHubActionsS3Deployment
+
+      - name: Confirm AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Synchronize website files to S3
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          aws s3 sync website/ "s3://${S3_BUCKET_NAME}" \
+            --delete \
+            --only-show-errors
+
+      - name: Verify uploaded objects
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          aws s3 ls "s3://${S3_BUCKET_NAME}" --recursive
+          aws s3api head-object \
+            --bucket "${S3_BUCKET_NAME}" \
+            --key "index.html"
+
+      - name: Write deployment summary
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          {
+            echo "## S3 deployment completed"
+            echo ""
+            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Bucket: \`${S3_BUCKET_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

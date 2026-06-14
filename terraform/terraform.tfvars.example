@@ -1,0 +1,4 @@
+aws_region        = "us-east-1"
+bucket_name       = "replace-with-a-globally-unique-bucket-name"
+github_owner      = "YOUR_GITHUB_USERNAME_OR_ORGANIZATION"
+github_repository = "github-actions-s3-demo"
