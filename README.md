@@ -1,6 +1,6 @@
 # GitHub Actions → Amazon S3 Demo
 
-A classroom-ready project that deploys static website files to an Amazon S3 bucket whenever code is pushed to the `main` branch.
+A project that deploys static website files to an Amazon S3 bucket whenever code is pushed to the `main` branch.
 
 ## Architecture
 
@@ -171,7 +171,7 @@ aws s3 sync website/ "s3://${S3_BUCKET_NAME}" --delete
 
 `--delete` removes bucket objects that no longer exist in the local `website/` directory.
 
-# Classroom demo sequence
+# Demo sequence
 
 1. Show the files in `website/`.
 2. Explain the workflow trigger.
