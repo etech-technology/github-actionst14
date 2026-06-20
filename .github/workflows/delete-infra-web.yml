@@ -1,0 +1,188 @@
+name: Destroy Website from Amazon S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: "Type DESTROY to confirm deletion"
+        required: true
+        type: string
+      delete_bucket:
+        description: "Also delete the S3 bucket after emptying it?"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: s3-production-destroy
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    name: Delete S3 website files
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Validate confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "You must type DESTROY to run this workflow."
+            exit 1
+          fi
+
+          echo "Destroy confirmation accepted."
+
+      - name: Validate required variables
+        shell: bash
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+
+          test -n "$AWS_REGION" || { echo "AWS_REGION variable is missing."; exit 1; }
+          test -n "$AWS_ROLE_ARN" || { echo "AWS_ROLE_ARN variable is missing."; exit 1; }
+          test -n "$S3_BUCKET_NAME" || { echo "S3_BUCKET_NAME variable is missing."; exit 1; }
+
+          echo "Required variables are present."
+
+      - name: Configure temporary AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHubActionsS3Destroy
+
+      - name: Confirm AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Confirm bucket exists
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+
+          aws s3api head-bucket --bucket "$S3_BUCKET_NAME"
+          echo "Bucket exists: $S3_BUCKET_NAME"
+
+      - name: Delete all website objects from S3 bucket
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+
+          echo "Deleting all objects from s3://${S3_BUCKET_NAME}"
+
+          aws s3 rm "s3://${S3_BUCKET_NAME}" \
+            --recursive \
+            --only-show-errors
+
+          echo "All regular objects deleted."
+
+      - name: Delete versioned objects if bucket versioning is enabled
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+
+          VERSIONING_STATUS=$(aws s3api get-bucket-versioning \
+            --bucket "$S3_BUCKET_NAME" \
+            --query "Status" \
+            --output text || true)
+
+          if [ "$VERSIONING_STATUS" = "Enabled" ] || [ "$VERSIONING_STATUS" = "Suspended" ]; then
+            echo "Bucket versioning is $VERSIONING_STATUS. Deleting object versions and delete markers."
+
+            aws s3api list-object-versions \
+              --bucket "$S3_BUCKET_NAME" \
+              --output json \
+              --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+              > versions.json
+
+            if [ "$(jq '.Objects | length' versions.json)" -gt 0 ]; then
+              aws s3api delete-objects \
+                --bucket "$S3_BUCKET_NAME" \
+                --delete file://versions.json
+            fi
+
+            aws s3api list-object-versions \
+              --bucket "$S3_BUCKET_NAME" \
+              --output json \
+              --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+              > delete-markers.json
+
+            if [ "$(jq '.Objects | length' delete-markers.json)" -gt 0 ]; then
+              aws s3api delete-objects \
+                --bucket "$S3_BUCKET_NAME" \
+                --delete file://delete-markers.json
+            fi
+
+            echo "Versioned objects and delete markers deleted."
+          else
+            echo "Bucket versioning is not enabled. Skipping version cleanup."
+          fi
+
+      - name: Delete S3 bucket if requested
+        if: ${{ github.event.inputs.delete_bucket == 'true' }}
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+
+          echo "Deleting bucket: $S3_BUCKET_NAME"
+          aws s3api delete-bucket --bucket "$S3_BUCKET_NAME"
+          echo "Bucket deleted."
+
+      - name: Verify cleanup
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+
+          if aws s3api head-bucket --bucket "$S3_BUCKET_NAME" 2>/dev/null; then
+            echo "Bucket still exists. Checking remaining objects..."
+
+            REMAINING_OBJECTS=$(aws s3 ls "s3://${S3_BUCKET_NAME}" --recursive | wc -l)
+
+            if [ "$REMAINING_OBJECTS" -eq 0 ]; then
+              echo "Bucket is empty."
+            else
+              echo "Some objects still remain:"
+              aws s3 ls "s3://${S3_BUCKET_NAME}" --recursive
+              exit 1
+            fi
+          else
+            echo "Bucket does not exist. It was deleted."
+          fi
+
+      - name: Write destroy summary
+        shell: bash
+        env:
+          S3_BUCKET_NAME: ${{ vars.S3_BUCKET_NAME }}
+        run: |
+          {
+            echo "## S3 destroy completed"
+            echo ""
+            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Bucket: \`${S3_BUCKET_NAME}\`"
+            echo "- Delete bucket requested: \`${{ github.event.inputs.delete_bucket }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
